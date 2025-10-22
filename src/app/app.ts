@@ -19,20 +19,19 @@ const storage = new LocalStorage();
 const dataSource = new AzureAISearchDataSource({
   name: "azure-ai-search",
   indexName: "onedrivebusiness-1760031907411-index",
+  // Azure AI Search
   azureAISearchApiKey: config.azureSearchKey!,
   azureAISearchEndpoint: config.azureSearchEndpoint!,
+  // Azure OpenAI (embeddings)
   azureOpenAIApiKey: config.azureOpenAIKey!,
   azureOpenAIEndpoint: config.azureOpenAIEndpoint!,
   azureOpenAIEmbeddingDeploymentName: config.azureOpenAIEmbeddingDeploymentName!,
-  // Retrieval tuning (no semantic ranker):
-  kNearestNeighborsCount: 16,
-  topPerVariant: 12,
-  maxPerParent: 4,
-  maxTotalAfterFusion: 6,
-  minTopScore: 0.12,
-  minScoreGap: 0.01,
-  maxContextTokens: 1200
+  // Vector-only knobs
+  kNearestNeighborsCount: 20, // or keep 16 if you prefer
+  top: 20,                    // fetch window (must be >= k)
+  maxReturn: 3                // send only top 3 back
 });
+
 
 const instructions = loadInstructions();
 
@@ -103,7 +102,7 @@ type SearchDecision = { shouldSearch: boolean; keywords: string[] };
 /**
  * Tiny LLM router: returns { shouldSearch, keywords }
  */
-async function shouldSearchLLMKeywords(query: string): Promise<SearchDecision> {
+async function shouldSearchLLMKeywords(query: string): Promise<boolean> {
   const deployment = config.azureOpenAIDeploymentName;
   const client = new OpenAI({
     apiKey: config.azureOpenAIKey,
@@ -113,44 +112,47 @@ async function shouldSearchLLMKeywords(query: string): Promise<SearchDecision> {
 
   const sys = `
 Decide if the user's query requires external knowledge retrieval (search over company documents).
-If retrieval is needed, output concise keywords.
 Respond ONLY in strict JSON:
-{"shouldSearch": true/false, "keywords": ["word1","word2",...]}
+{"shouldSearch": true/false}
 Rules:
-- If retrieval is not needed, use {"shouldSearch": false, "keywords": []}.
-- Use 1–8 short keyword tokens/phrases.
-- Avoid filler words, punctuation, or duplicates.
+- Respond true if the question needs factual, company-specific, or document-based information.
+- Respond false if it can be answered without external context.
 `.trim();
 
   const msg = [
     { role: "system", content: sys },
     { role: "user", content: query }
-  ] satisfies ChatCompletionMessageParam[];
+  ] satisfies ChatCompletionMessageParam[];;
 
   const res = await client.chat.completions.create({
     model: config.azureOpenAIDeploymentName,
     messages: msg,
-    max_tokens: 48,
+    max_tokens: 16,
     temperature: 0
   });
 
   const raw = (res.choices[0]?.message?.content ?? "").trim();
 
   try {
-    const parsed = JSON.parse(raw) as SearchDecision;
-    if (typeof parsed?.shouldSearch === "boolean" && Array.isArray(parsed?.keywords)) return parsed;
+    const parsed = JSON.parse(raw);
+    if (typeof parsed?.shouldSearch === "boolean") {
+      return parsed.shouldSearch;
+    }
   } catch {
     const m = raw.match(/\{[\s\S]*\}/);
     if (m) {
       try {
-        const parsed = JSON.parse(m[0]) as SearchDecision;
-        if (typeof parsed?.shouldSearch === "boolean" && Array.isArray(parsed?.keywords)) return parsed;
+        const parsed = JSON.parse(m[0]);
+        if (typeof parsed?.shouldSearch === "boolean") {
+          return parsed.shouldSearch;
+        }
       } catch { }
     }
   }
 
-  return { shouldSearch: false, keywords: [] };
+  return false;
 }
+
 
 // ------------------------ MESSAGE HANDLER ------------------------
 
@@ -170,23 +172,18 @@ app.on("message", async ({ send, activity }) => {
 
     // Heuristic removed: rely solely on LLM router
     const decision = await shouldSearchLLMKeywords(activity.text);
-    const shouldSearch = decision.shouldSearch;
-    const keywords = decision.keywords ?? [];
+    const shouldSearch = decision;
 
     // 🔍 Debug log line
     console.log(
-      `[Search Router] shouldSearch=${shouldSearch} | keywords=${keywords.length ? keywords.join(", ") : "(none)"}`
+      `[Search Router] shouldSearch=${shouldSearch}`
     );
 
     let turnMessages: Message[] = [...messages];
     let contextData = "";
 
     if (shouldSearch) {
-      const augmentedQuery =
-        keywords.length > 0
-          ? `${activity.text}\n\n[focus terms: ${keywords.join(", ")}]`
-          : activity.text;
-
+      const augmentedQuery =`${activity.text}`
       contextData = (await dataSource.renderContext(augmentedQuery)).trim();
       if (contextData) {
         turnMessages.push({
